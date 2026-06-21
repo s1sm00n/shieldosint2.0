@@ -3,43 +3,29 @@ import json
 from flask import Flask, request, jsonify
 from apify_client import ApifyClient
 from supabase import create_client, Client
-import google.generativeai as genai
+from groq import Groq
 
 # --- НАСТРОЙКИ И КЛЮЧИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "ТВОЙ_APIFY_ТОКЕН")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "ТВОЙ_SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "ТВОЙ_SUPABASE_ANON_KEY")
-AI_API_KEY = os.environ.get("AI_API_KEY", "ТВОЙ_GEMINI_API_KEY") # Или OpenAI
+AI_API_KEY = os.environ.get("AI_API_KEY", "ТВОЙ_AI_КЛЮЧ") # <--- Ключ Groq
 
 # Инициализация клиентов
+
 apify = ApifyClient(APIFY_TOKEN)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-genai.configure(api_key=AI_API_KEY)
-ai_model = genai.GenerativeModel('gemini-1.5-flash') # Быстрая и дешевая модель
+groq_client = Groq(api_key=AI_API_KEY) # <--- Инициализация клиента Groq
 
 app = Flask(__name__)
 
-# --- 1. ПАРСИНГ ЧЕРЕЗ APIFY ---
-def scrape_instagram_profile(username):
-    clean_username = username.split("instagram.com/")[-1].replace("/", "").split("?")[0] if "instagram.com" in username else username
-    run = apify.actor("apify/instagram-scraper").call(run_input={"directUrls": [f"https://www.instagram.com/{clean_username}/"], "resultsType": "details"})
-    for item in apify.dataset(run["defaultDatasetId"]).iterate_items():
-        return item
-    return None
+# [ ... Функции парсинга scrape_instagram_profile и scrape_tiktok_profile остаются БЕЗ ИЗМЕНЕНИЙ ... ]
 
-def scrape_tiktok_profile(username):
-    clean_username = username.split("@")[-1].split("?")[0] if "tiktok.com" in username else username.replace("@", "")
-    run = apify.actor("clockworks/tiktok-scraper").call(run_input={"profiles": [clean_username], "resultsPerPage": 1})
-    for item in apify.dataset(run["defaultDatasetId"]).iterate_items():
-        return item
-    return None
-
-# --- 2. АНАЛИЗ С ПОМОЩЬЮ ИИ ---
+# --- 2. АНАЛИЗ С ПОМОЩЬЮ ИИ (GROQ) ---
 def analyze_with_ai(platform, profile_data):
     if not profile_data:
         return {"risk_score": 0, "reasons": ["Данные не найдены"]}
 
-    # Собираем выжимку для ИИ, чтобы не тратить токены на лишний мусор
     if platform == "instagram":
         summary = f"""
         Платформа: Instagram
@@ -61,32 +47,46 @@ def analyze_with_ai(platform, profile_data):
         Описание (Bio): {user_info.get('signature', '')}
         """
 
-    # Промпт для нейросети
     prompt = f"""
-    Выступи в роли эксперта по кибербезопасности. Проанализируй данные профиля и определи вероятность того, что это мошенник (скамер). 
-    Обрати внимание на спам-слова в описании (крипта, инвестиции, заработок, сигналы), аномальное соотношение подписок/подписчиков.
+    Выступи в роли эксперта по кибербезопасности. Проанализируй данные профиля и определи вероятность того, что это мошенник.
+    Обрати внимание на слова в описании (крипта, инвестиции, заработок), аномальное соотношение подписок/подписчиков.
     
     Данные профиля:
     {summary}
 
-    Верни ответ СТРОГО в формате JSON без markdown и лишних слов:
-    {{
-        "risk_score": число от 0 до 100,
-        "reasons": ["Причина 1", "Причина 2"]
-    }}
+    Верни ответ СТРОГО в формате JSON со следующими ключами:
+    "risk_score" (число от 0 до 100)
+    "reasons" (массив строк с причинами)
     """
     
     try:
-        response = ai_model.generate_content(prompt)
+        # Вызов API Groq
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "Ты AI-аналитик. Ты отвечаешь только валидным JSON."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            # Можно использовать llama3-8b-8192 для скорости или llama3-70b-8192 для ума
+            model="llama3-70b-8192", 
+            # Эта настройка ЗАСТАВЛЯЕТ Groq вернуть чистый JSON без markdown (никаких ```json)
+            response_format={"type": "json_object"} 
+        )
         
-        # Очищаем ответ ИИ от возможных артефактов markdown
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        result = json.loads(clean_text)
+        # Получаем ответ и сразу парсим, так как это уже чистый JSON
+        response_text = chat_completion.choices[0].message.content
+        result = json.loads(response_text)
         return result
+        
     except Exception as e:
-        print(f"Ошибка ИИ: {e}")
-        return {"risk_score": 50, "reasons": ["Ошибка анализа ИИ, требуется ручная проверка"]}
-
+        print(f"Ошибка ИИ Groq: {e}")
+        return {"risk_score": 50, "reasons": ["Ошибка анализа ИИ, требуется ручная
+                                              
 # --- 3. ЗАПИСЬ В БАЗУ ДАННЫХ (SUPABASE) ---
 def save_incident_to_supabase(target_username, platform, ai_report, raw_data):
     try:
