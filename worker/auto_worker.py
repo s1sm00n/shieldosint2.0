@@ -79,8 +79,7 @@ def analyze_with_ai(platform, profile_data):
     try:
         response = ai_model.generate_content(prompt)
         # Очищаем ответ ИИ от возможных артефактов markdown
-        clean_text = response.text.replace("```json", "").replace("
-```", "").strip()
+        clean_text = response.text.replace("```json", "").replace("```", "").strip()
         result = json.loads(clean_text)
         return result
     except Exception as e:
