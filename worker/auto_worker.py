@@ -1,83 +1,152 @@
 import os
-import time
 import json
+from flask import Flask, request, jsonify
 from apify_client import ApifyClient
-from groq import Groq
-from supabase import create_client
-from dotenv import load_dotenv
+from supabase import create_client, Client
+import google.generativeai as genai
 
-load_dotenv()
+# --- НАСТРОЙКИ И КЛЮЧИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "ТВОЙ_APIFY_ТОКЕН")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "ТВОЙ_SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "ТВОЙ_SUPABASE_ANON_KEY")
+AI_API_KEY = os.environ.get("AI_API_KEY", "ТВОЙ_GEMINI_API_KEY") # Или OpenAI
 
-# Инициализация
-apify = ApifyClient(os.environ.get("APIFY_TOKEN"))
-groq = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
+# Инициализация клиентов
+apify = ApifyClient(APIFY_TOKEN)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+genai.configure(api_key=AI_API_KEY)
+ai_model = genai.GenerativeModel('gemini-1.5-flash') # Быстрая и дешевая модель
 
-def log_to_system(message):
-    """Пишем технические логи в Supabase"""
-    supabase.table("system_logs").insert({"message": message}).execute()
-    print(f"[{time.strftime('%X')}] {message}")
+app = Flask(__name__)
 
-def analyze_content(dossier):
-    prompt = f"Проанализируй данные на мошенничество: {json.dumps(dossier)}"
-    response = groq.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama3-8b-8192"
-    )
-    return response.choices[0].message.content
+# --- 1. ПАРСИНГ ЧЕРЕЗ APIFY ---
+def scrape_instagram_profile(username):
+    clean_username = username.split("instagram.com/")[-1].replace("/", "").split("?")[0] if "instagram.com" in username else username
+    run = apify.actor("apify/instagram-scraper").call(run_input={"directUrls": [f"https://www.instagram.com/{clean_username}/"], "resultsType": "details"})
+    for item in apify.dataset(run["defaultDatasetId"]).iterate_items():
+        return item
+    return None
 
-def run_tiktok():
-    log_to_system("Запуск парсинга TikTok...")
-    run = apify.actor("clockworks/tiktok-scraper").call(
-        run_input={"hashtags": ["инвестиции"], "resultsLimit": 3}
-    )
-    return apify.dataset(run.get("defaultDatasetId")).list_items().items
+def scrape_tiktok_profile(username):
+    clean_username = username.split("@")[-1].split("?")[0] if "tiktok.com" in username else username.replace("@", "")
+    run = apify.actor("clockworks/tiktok-scraper").call(run_input={"profiles": [clean_username], "resultsPerPage": 1})
+    for item in apify.dataset(run["defaultDatasetId"]).iterate_items():
+        return item
+    return None
 
-def run_instagram():
-    log_to_system("Запуск парсинга Instagram...")
-    # Instagram требует больше ресурсов, используем официальный скрейпер
-    run = apify.actor("apify/instagram-scraper").call(
-        run_input={
-            "hashtags": ["инвестиции"],
-            "resultsLimit": 3,
-            # ВАЖНО: сюда нужно вставить куки, если Instagram будет блокировать
-            # "sessionCookies": [...] 
-        }
-    )
-    return apify.dataset(run.get("defaultDatasetId")).list_items().items
+# --- 2. АНАЛИЗ С ПОМОЩЬЮ ИИ ---
+def analyze_with_ai(platform, profile_data):
+    if not profile_data:
+        return {"risk_score": 0, "reasons": ["Данные не найдены"]}
 
-def process_items(items, platform):
-    for item in items:
-        # Унификация данных для анализа
-        url = item.get("webVideoUrl") or item.get("url")
-        text = item.get("title") or item.get("caption")
-        
-        if supabase.table("incidents").select("id").eq("url", url).execute().data:
-            continue
-            
-        dossier = {"platform": platform, "text": text, "author": item.get("ownerUsername") or item.get("authorMeta", {}).get("name")}
-        analysis = analyze_content(dossier)
-        
-        supabase.table("incidents").insert({
+    # Собираем выжимку для ИИ, чтобы не тратить токены на лишний мусор
+    if platform == "instagram":
+        summary = f"""
+        Платформа: Instagram
+        Подписчики: {profile_data.get('followersCount', 0)}
+        Подписки: {profile_data.get('followsCount', 0)}
+        Посты: {profile_data.get('postsCount', 0)}
+        Верификация: {profile_data.get('isVerified', False)}
+        Описание (Bio): {profile_data.get('biography', '')}
+        """
+    else:
+        stats = profile_data.get("userInfo", {}).get("stats", {})
+        user_info = profile_data.get("userInfo", {}).get("user", {})
+        summary = f"""
+        Платформа: TikTok
+        Подписчики: {stats.get('followerCount', 0)}
+        Подписки: {stats.get('followingCount', 0)}
+        Посты: {stats.get('videoCount', 0)}
+        Верификация: {user_info.get('verified', False)}
+        Описание (Bio): {user_info.get('signature', '')}
+        """
+
+    # Промпт для нейросети
+    prompt = f"""
+    Выступи в роли эксперта по кибербезопасности. Проанализируй данные профиля и определи вероятность того, что это мошенник (скамер). 
+    Обрати внимание на спам-слова в описании (крипта, инвестиции, заработок, сигналы), аномальное соотношение подписок/подписчиков.
+    
+    Данные профиля:
+    {summary}
+
+    Верни ответ СТРОГО в формате JSON без markdown и лишних слов:
+    {{
+        "risk_score": число от 0 до 100,
+        "reasons": ["Причина 1", "Причина 2"]
+    }}
+    """
+    
+    try:
+        response = ai_model.generate_content(prompt)
+        # Очищаем ответ ИИ от возможных артефактов markdown
+        clean_text = response.text.replace("```json", "").replace("
+```", "").strip()
+        result = json.loads(clean_text)
+        return result
+    except Exception as e:
+        print(f"Ошибка ИИ: {e}")
+        return {"risk_score": 50, "reasons": ["Ошибка анализа ИИ, требуется ручная проверка"]}
+
+# --- 3. ЗАПИСЬ В БАЗУ ДАННЫХ (SUPABASE) ---
+def save_incident_to_supabase(target_username, platform, ai_report, raw_data):
+    try:
+        # Формируем структуру данных для твоей таблицы
+        incident_data = {
+            "target_user": target_username,
             "platform": platform,
-            "url": url,
-            "description": text,
-            "analysis": analysis
-        }).execute()
-        log_to_system(f"Инцидент найден: {platform} | {url}")
+            "risk_score": ai_report.get("risk_score", 0),
+            "reasons": ai_report.get("reasons", []),
+            "status": "pending_review", # Статус для дашборда
+            "raw_profile_data": raw_data # Сохраняем сырые данные на всякий случай
+        }
+        
+        # Запись в таблицу 'incidents' (убедись, что она создана в Supabase)
+        response = supabase.table("incidents").insert(incident_data).execute()
+        return response.data
+    except Exception as e:
+        print(f"Ошибка сохранения в Supabase: {e}")
+        return None
 
+# --- 4. API ЭНДПОИНТ ДЛЯ ЗАПУСКА ---
+@app.route('/scan', methods=['POST', 'GET'])
+def scan_profile():
+    platform = request.args.get('platform') or request.json.get('platform')
+    username = request.args.get('username') or request.json.get('username')
+
+    if not platform or not username:
+        return jsonify({"error": "Требуются параметры platform и username"}), 400
+
+    platform = platform.lower()
+    
+    # 1. Парсинг
+    if platform == "instagram":
+        raw_data = scrape_instagram_profile(username)
+    elif platform == "tiktok":
+        raw_data = scrape_tiktok_profile(username)
+    else:
+        return jsonify({"error": "Платформа не поддерживается"}), 400
+
+    if not raw_data:
+        return jsonify({"error": "Профиль не найден или закрыт"}), 404
+
+    # 2. ИИ Анализ
+    ai_report = analyze_with_ai(platform, raw_data)
+
+    # 3. Сохранение в Supabase (только если есть подозрения, или можно сохранять всё)
+    # Например, сохраняем в дашборд, если риск больше 30%
+    if ai_report.get("risk_score", 0) >= 30:
+        db_record = save_incident_to_supabase(username, platform, ai_report, raw_data)
+        ai_report["db_status"] = "saved_to_dashboard"
+    else:
+        ai_report["db_status"] = "ignored_low_risk"
+
+    return jsonify({
+        "target": username,
+        "platform": platform,
+        "ai_analysis": ai_report
+    }), 200
+
+# --- 5. ЗАПУСК ДЛЯ RENDER ---
 if __name__ == "__main__":
-    while True:
-        try:
-            # Парсим обе сети
-            tiktok_data = run_tiktok()
-            process_items(tiktok_data, "TikTok")
-            
-            insta_data = run_instagram()
-            process_items(insta_data, "Instagram")
-            
-            log_to_system("Цикл завершен, сон 15 минут...")
-        except Exception as e:
-            log_to_system(f"ОШИБКА: {str(e)}")
-            
-        time.sleep(900)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
