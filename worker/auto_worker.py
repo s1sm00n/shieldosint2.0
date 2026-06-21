@@ -85,7 +85,7 @@ def analyze_with_ai(platform, profile_data):
         
     except Exception as e:
         print(f"Ошибка ИИ Groq: {e}")
-        return {"risk_score": 50, "reasons": ["Ошибка анализа ИИ, требуется ручная
+        return {"risk_score": 50, "reasons": ["Ошибка анализа ИИ, требуется ручная пропись"]}
                                               
 # --- 3. ЗАПИСЬ В БАЗУ ДАННЫХ (SUPABASE) ---
 def save_incident_to_supabase(target_username, platform, ai_report, raw_data):
