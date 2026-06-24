@@ -71,7 +71,7 @@ def advanced_ai_analysis(dossier):
                 {"role": "system", "content": "Выдавай ответ строго в формате валидного JSON без разметки markdown."},
                 {"role": "user", "content": prompt}
             ],
-            model="llama3-8b-8192",
+            model="llama-3.1-8b-instant",
             temperature=0.1,
             response_format={"type": "json_object"}
         )
