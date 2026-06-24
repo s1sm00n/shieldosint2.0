@@ -2,4 +2,4 @@ apify-client
 groq
 supabase
 python-dotenv
-Flask
+asyncio
