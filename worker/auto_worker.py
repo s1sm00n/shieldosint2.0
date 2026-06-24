@@ -21,6 +21,10 @@ class HealthCheckServer(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"AI Media Watch Worker is Alive")
+        
+    def do_HEAD(self): # Render использует HEAD для проверки
+        self.send_response(200)
+        self.end_headers()
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
@@ -93,15 +97,17 @@ def run_tiktok():
         return []
 
 def run_instagram():
-    log_to_system("Глубокий парсинг Instagram по триггерам...")
+    log_to_system("Глубокий парсинг Instagram по прямым ссылкам...")
     try:
-        # ИСПРАВЛЕНО: Теперь используем правильные параметры поиска
+        # ИСПРАВЛЕНО: Даем прямую ссылку, чтобы он не искал через Google
         run = apify.actor("apify/instagram-scraper").call(
             run_input={
-                "search": "#заработок", 
-                "searchType": "hashtag",
+                "directUrls": [
+                    "https://www.instagram.com/explore/tags/заработок/",
+                    "https://www.instagram.com/explore/tags/инвестиции/"
+                ],
                 "resultsLimit": 3,
-                "expandTypes": ["comments"]
+                "resultsType": "details"
             }
         )
         dataset_id = get_dataset_id(run)
