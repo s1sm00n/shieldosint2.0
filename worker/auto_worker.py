@@ -1,152 +1,140 @@
 import os
+import time
 import json
-from flask import Flask, request, jsonify
 from apify_client import ApifyClient
-from supabase import create_client, Client
 from groq import Groq
+from supabase import create_client
+from dotenv import load_dotenv
 
-# --- НАСТРОЙКИ И КЛЮЧИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---
-APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "ТВОЙ_APIFY_ТОКЕН")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "ТВОЙ_SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "ТВОЙ_SUPABASE_ANON_KEY")
-AI_API_KEY = os.environ.get("AI_API_KEY", "ТВОЙ_AI_КЛЮЧ") # <--- Ключ Groq
+load_dotenv()
 
-# Инициализация клиентов
+apify = ApifyClient(os.environ.get("APIFY_TOKEN"))
+groq = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
-apify = ApifyClient(APIFY_TOKEN)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-groq_client = Groq(api_key=AI_API_KEY) # <--- Инициализация клиента Groq
+def log_to_system(message):
+    try:
+        supabase.table("system_logs").insert({"message": message}).execute()
+    except Exception:
+        pass
+    print(f"[{time.strftime('%X')}] {message}")
 
-app = Flask(__name__)
-
-# [ ... Функции парсинга scrape_instagram_profile и scrape_tiktok_profile остаются БЕЗ ИЗМЕНЕНИЙ ... ]
-
-# --- 2. АНАЛИЗ С ПОМОЩЬЮ ИИ (GROQ) ---
-def analyze_with_ai(platform, profile_data):
-    if not profile_data:
-        return {"risk_score": 0, "reasons": ["Данные не найдены"]}
-
-    if platform == "instagram":
-        summary = f"""
-        Платформа: Instagram
-        Подписчики: {profile_data.get('followersCount', 0)}
-        Подписки: {profile_data.get('followsCount', 0)}
-        Посты: {profile_data.get('postsCount', 0)}
-        Верификация: {profile_data.get('isVerified', False)}
-        Описание (Bio): {profile_data.get('biography', '')}
-        """
-    else:
-        stats = profile_data.get("userInfo", {}).get("stats", {})
-        user_info = profile_data.get("userInfo", {}).get("user", {})
-        summary = f"""
-        Платформа: TikTok
-        Подписчики: {stats.get('followerCount', 0)}
-        Подписки: {stats.get('followingCount', 0)}
-        Посты: {stats.get('videoCount', 0)}
-        Верификация: {user_info.get('verified', False)}
-        Описание (Bio): {user_info.get('signature', '')}
-        """
-
+def advanced_ai_analysis(dossier):
+    """
+    Ультимативный промпт под критерии хакатона AI Media Watch.
+    Оценивает риски, выявляет паттерны мошенничества и ИИ-генерацию.
+    """
     prompt = f"""
-    Выступи в роли эксперта по кибербезопасности. Проанализируй данные профиля и определи вероятность того, что это мошенник.
-    Обрати внимание на слова в описании (крипта, инвестиции, заработок), аномальное соотношение подписок/подписчиков.
-    
-    Данные профиля:
-    {summary}
+    Ты — эксперт кибербезопасности и OSINT-аналитик. Проведи жесткий аудит медиа-контента на основе следующих данных:
+    {json.dumps(dossier, ensure_ascii=False)}
 
-    Верни ответ СТРОГО в формате JSON со следующими ключами:
-    "risk_score" (число от 0 до 100)
-    "reasons" (массив строк с причинами)
+    Твоя задача — выявить признаки незаконного игорного бизнеса, финансовых пирамид и мошенничества в РК.
+    
+    СТРОГО следуй инструкции и верни ответ В ФОРМАТЕ JSON (и ничего кроме JSON!):
+    {{
+      "risk_score": <число от 0 до 100>,
+      "verdict": "<CASINO / PYRAMID / SCAM / CLEAN>",
+      "ai_generated_evidence": "<есть ли признаки генерации текста/видео через ИИ, дипфейки, робо-озвучка. Опиши подробно>",
+      "detected_patterns": ["<перечисли найденные маркеры: реферальные ссылки, обещания легких денег, скрытые призывы>"],
+      "explanation": "<развернутое аналитическое объяснение и обоснование решения для презентации>"
+    }}
     """
     
     try:
-        # Вызов API Groq
-        chat_completion = groq_client.chat.completions.create(
+        response = groq.chat.completions.create(
             messages=[
-                {
-                    "role": "system", 
-                    "content": "Ты AI-аналитик. Ты отвечаешь только валидным JSON."
-                },
-                {
-                    "role": "user", 
-                    "content": prompt
-                }
+                {"role": "system", "content": "Выдавай ответ строго в формате валидного JSON без разметки markdown."},
+                {"role": "user", "content": prompt}
             ],
-            # Можно использовать llama3-8b-8192 для скорости или llama3-70b-8192 для ума
-            model="llama3-70b-8192", 
-            # Эта настройка ЗАСТАВЛЯЕТ Groq вернуть чистый JSON без markdown (никаких ```json)
-            response_format={"type": "json_object"} 
+            model="llama3-8b-8192",
+            temperature=0.1,
+            response_format={"type": "json_object"}
         )
-        
-        # Получаем ответ и сразу парсим, так как это уже чистый JSON
-        response_text = chat_completion.choices[0].message.content
-        result = json.loads(response_text)
-        return result
-        
+        return json.loads(response.choices[0].message.content)
     except Exception as e:
-        print(f"Ошибка ИИ Groq: {e}")
-        return {"risk_score": 50, "reasons": ["Ошибка анализа ИИ, требуется ручная пропись"]}
-                                              
-# --- 3. ЗАПИСЬ В БАЗУ ДАННЫХ (SUPABASE) ---
-def save_incident_to_supabase(target_username, platform, ai_report, raw_data):
-    try:
-        # Формируем структуру данных для твоей таблицы
-        incident_data = {
-            "target_user": target_username,
-            "platform": platform,
-            "risk_score": ai_report.get("risk_score", 0),
-            "reasons": ai_report.get("reasons", []),
-            "status": "pending_review", # Статус для дашборда
-            "raw_profile_data": raw_data # Сохраняем сырые данные на всякий случай
-        }
-        
-        # Запись в таблицу 'incidents' (убедись, что она создана в Supabase)
-        response = supabase.table("incidents").insert(incident_data).execute()
-        return response.data
-    except Exception as e:
-        print(f"Ошибка сохранения в Supabase: {e}")
+        log_to_system(f"Ошибка Groq: {str(e)}")
         return None
 
-# --- 4. API ЭНДПОИНТ ДЛЯ ЗАПУСКА ---
-@app.route('/scan', methods=['POST', 'GET'])
-def scan_profile():
-    platform = request.args.get('platform') or request.json.get('platform')
-    username = request.args.get('username') or request.json.get('username')
+def run_tiktok():
+    log_to_system("Глубокий парсинг TikTok по триггерам...")
+    # Ищем по целевым триггерам хакатона
+    run = apify.actor("clockworks/tiktok-scraper").call(
+        run_input={
+            "hashtags": ["инвестиции", "заработок", "казино"], 
+            "resultsLimit": 5,
+            "shouldDownloadVideos": False,
+            "shouldDownloadSubtitles": True # Тянем субтитры, если они есть
+        }
+    )
+    return apify.dataset(run.get("defaultDatasetId")).list_items().items
 
-    if not platform or not username:
-        return jsonify({"error": "Требуются параметры platform и username"}), 400
+def run_instagram():
+    log_to_system("Глубокий парсинг Instagram по триггерам...")
+    run = apify.actor("apify/instagram-scraper").call(
+        run_input={
+            "search": "легкий заработок казахстан",
+            "resultsLimit": 5,
+            "expandTypes": ["comments", "detailed_video_info"]
+        }
+    )
+    return apify.dataset(run.get("defaultDatasetId")).list_items().items
 
-    platform = platform.lower()
+def process_and_analyze():
+    # Собираем данные
+    platforms = [("TikTok", run_tiktok), ("Instagram", run_instagram)]
     
-    # 1. Парсинг
-    if platform == "instagram":
-        raw_data = scrape_instagram_profile(username)
-    elif platform == "tiktok":
-        raw_data = scrape_tiktok_profile(username)
-    else:
-        return jsonify({"error": "Платформа не поддерживается"}), 400
+    for platform_name, parser_func in platforms:
+        try:
+            items = parser_func()
+            for item in items:
+                url = item.get("webVideoUrl") or item.get("url") or item.get("inputUrl")
+                if not url:
+                    continue
+                
+                # Проверяем дубликаты
+                if supabase.table("incidents").select("id").eq("url", url).execute().data:
+                    continue
+                
+                # Собираем максимум текстовых маркеров из метаданных (текст, субтитры, теги)
+                video_text = item.get("title") or item.get("caption") or ""
+                subtitles = " ".join([s.get("text", "") for s in item.get("subtitles", [])])
+                comments = " ".join([c.get("text", "") for c in item.get("latestComments", [])])
+                
+                full_transcription = f"{video_text} {subtitles} {comments}"
+                
+                dossier = {
+                    "platform": platform_name,
+                    "url": url,
+                    "raw_text": full_transcription,
+                    "author": item.get("authorMeta", {}).get("name") or item.get("ownerUsername"),
+                    "view_count": item.get("playCount") or item.get("videoPlayCount", 0),
+                    "timestamp": item.get("createTimeISO") or item.get("timestamp")
+                }
+                
+                analysis = advanced_ai_analysis(dossier)
+                if not analysis:
+                    continue
+                
+                # Пишем структурированные данные для красивых графиков на фронтенде
+                supabase.table("incidents").insert({
+                    "platform": platform_name,
+                    "url": url,
+                    "description": video_text[:500],
+                    "risk_score": analysis.get("risk_score", 0),
+                    "verdict": analysis.get("verdict", "CLEAN"),
+                    "ai_evidence": analysis.get("ai_generated_evidence", ""),
+                    "patterns": analysis.get("detected_patterns", []),
+                    "analysis_text": analysis.get("explanation", "")
+                }).execute()
+                
+                log_to_system(f"Инцидент внесен [{platform_name}]: {analysis.get('verdict')} (Риск: {analysis.get('risk_score')})")
+                
+        except Exception as e:
+            log_to_system(f"Ошибка обработки {platform_name}: {str(e)}")
 
-    if not raw_data:
-        return jsonify({"error": "Профиль не найден или закрыт"}), 404
-
-    # 2. ИИ Анализ
-    ai_report = analyze_with_ai(platform, raw_data)
-
-    # 3. Сохранение в Supabase (только если есть подозрения, или можно сохранять всё)
-    # Например, сохраняем в дашборд, если риск больше 30%
-    if ai_report.get("risk_score", 0) >= 30:
-        db_record = save_incident_to_supabase(username, platform, ai_report, raw_data)
-        ai_report["db_status"] = "saved_to_dashboard"
-    else:
-        ai_report["db_status"] = "ignored_low_risk"
-
-    return jsonify({
-        "target": username,
-        "platform": platform,
-        "ai_analysis": ai_report
-    }), 200
-
-# --- 5. ЗАПУСК ДЛЯ RENDER ---
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    log_to_system("Сервис AI Media Watch запущен в облаке Render.")
+    while True:
+        process_and_analyze()
+        log_to_system("Цикл завершен. Сон 10 минут...")
+        time.sleep(600)
