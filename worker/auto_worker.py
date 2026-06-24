@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 apify = ApifyClient(os.environ.get("APIFY_TOKEN"))
-AI = AI(api_key=os.environ.get("AI_API_KEY"))
+Groq = Groq(api_key=os.environ.get("AI_API_KEY"))
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
 def log_to_system(message):
