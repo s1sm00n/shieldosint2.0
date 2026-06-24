@@ -14,7 +14,7 @@ apify = ApifyClient(os.environ.get("APIFY_TOKEN"))
 groq = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
-# --- ЗАГЛУШКА ДЛЯ RENDER (Чтобы сервис не падал по таймауту портов) ---
+# --- ЗАГЛУШКА ДЛЯ RENDER ---
 class HealthCheckServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -26,15 +26,24 @@ def start_health_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckServer)
     server.serve_forever()
-# -----------------------------------------------------------------
+# ---------------------------
 
 def log_to_system(message):
     try:
         supabase.table("system_logs").insert({"message": message}).execute()
     except Exception:
         pass
-    # flush=True заставляет Render выводить логи мгновенно в консоль
     print(f"[{time.strftime('%X')}] {message}", flush=True)
+
+# УНИВЕРСАЛЬНЫЙ ИЗВЛЕКАТЕЛЬ ID (Решает ошибку "Run object has no attribute get")
+def get_dataset_id(run_obj):
+    if hasattr(run_obj, 'get'):
+        return run_obj.get("defaultDatasetId")
+    if hasattr(run_obj, 'defaultDatasetId'):
+        return run_obj.defaultDatasetId
+    if hasattr(run_obj, 'default_dataset_id'):
+        return run_obj.default_dataset_id
+    return run_obj["defaultDatasetId"]
 
 def advanced_ai_analysis(dossier):
     prompt = f"""
@@ -72,12 +81,13 @@ def run_tiktok():
     try:
         run = apify.actor("clockworks/tiktok-scraper").call(
             run_input={
-                "hashtags": ["инвестиции", "заработок"], 
+                "hashtags": ["инвестиции", "заработок", "казино"], 
                 "resultsLimit": 3,
                 "shouldDownloadSubtitles": True
             }
         )
-        return apify.dataset(run.get("defaultDatasetId")).list_items().items
+        dataset_id = get_dataset_id(run)
+        return apify.dataset(dataset_id).list_items().items
     except Exception as e:
         log_to_system(f"Ошибка вызова TikTok Scraper: {str(e)}")
         return []
@@ -85,15 +95,17 @@ def run_tiktok():
 def run_instagram():
     log_to_system("Глубокий парсинг Instagram по триггерам...")
     try:
-        # ИСПРАВЛЕНО: переключено на хэштеги для 105% стабильности результатов
+        # ИСПРАВЛЕНО: Теперь используем правильные параметры поиска
         run = apify.actor("apify/instagram-scraper").call(
             run_input={
-                "hashtags": ["инвестиции", "заработок"],
+                "search": "#заработок", 
+                "searchType": "hashtag",
                 "resultsLimit": 3,
                 "expandTypes": ["comments"]
             }
         )
-        return apify.dataset(run.get("defaultDatasetId")).list_items().items
+        dataset_id = get_dataset_id(run)
+        return apify.dataset(dataset_id).list_items().items
     except Exception as e:
         log_to_system(f"Ошибка вызова Instagram Scraper: {str(e)}")
         return []
@@ -150,7 +162,6 @@ def process_and_analyze():
 
 if __name__ == "__main__":
     log_to_system("Запуск фейк-сервера для детекции портов Render...")
-    # Запускаем сервер портов в отдельном потоке, чтобы он не мешал парсингу
     threading.Thread(target=start_health_server, daemon=True).start()
     
     log_to_system("Сервис AI Media Watch запущен в облаке Render.")
